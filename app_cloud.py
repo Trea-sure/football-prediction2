@@ -1,5 +1,5 @@
-# ==================== 足球智能预测系统 v5.2 (Cloud Edition) ====================
-# 优化：适配 Streamlit Cloud，修复 Selenium 配置
+# ==================== 足球智能预测系统 v5.2 (Cloud Edition + 反爬优化) ====================
+# 优化：适配 Streamlit Cloud，增加随机延迟避免被封
 
 import streamlit as st
 import requests
@@ -11,6 +11,7 @@ import time
 import json
 import os
 import pickle
+import random  # 新增：用于随机延迟
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import List, Dict, Tuple, Optional
@@ -166,10 +167,10 @@ class DataPersistence:
         }
 
 
-# ==================== 数据采集模块 (Cloud Optimized) ====================
+# ==================== 数据采集模块 (反爬优化版) ====================
 
 class DataCollector:
-    """适配云端的修复版数据采集器"""
+    """适配云端 + 反爬优化的数据采集器"""
 
     def __init__(self):
         self.driver = None
@@ -181,6 +182,10 @@ class DataCollector:
             'daxiao': "https://odds.500.com/fenxi/daxiao-{}.shtml"
         }
         self.log_callback = None
+        # 新增：请求计数和频率控制
+        self.request_count = 0
+        self.last_request_time = 0
+        self.session_initialized = False
 
     def set_log_callback(self, callback):
         self.log_callback = callback
@@ -189,6 +194,22 @@ class DataCollector:
         if self.log_callback:
             self.log_callback(message)
         print(message)
+
+    def _random_delay(self, min_sec=2, max_sec=5):
+        """随机延迟，模拟真人操作"""
+        delay = random.uniform(min_sec, max_sec)
+        time.sleep(delay)
+        return delay
+
+    def _cool_down_if_needed(self):
+        """强制冷却：每5个请求后额外等待"""
+        self.request_count += 1
+        if self.request_count % 5 == 0:
+            cool_time = random.uniform(10, 15)
+            self._log(f"⏳ 强制冷却 {cool_time:.1f} 秒（已请求 {self.request_count} 次）...")
+            time.sleep(cool_time)
+            return True
+        return False
 
     def get_driver(self):
         """获取配置好的 Chrome WebDriver - 支持本地和云端环境"""
@@ -216,11 +237,20 @@ class DataCollector:
             options.add_experimental_option("excludeSwitches", ["enable-automation"])
             options.add_experimental_option('useAutomationExtension', False)
             
-            # 设置 User-Agent
-            options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.0")
+            # 设置 User-Agent（轮换多个）
+            user_agents = [
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.0",
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.0",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.0 Edg/118.0.2088.46"
+            ]
+            options.add_argument(f"--user-agent={random.choice(user_agents)}")
             
             # 禁用图片加载（加速）
             options.add_experimental_option("prefs", {"profile.managed_default_content_settings.images": 2})
+            
+            # 新增：Cookie 和 Session 保持
+            options.add_argument("--disable-features=IsolateOrigins,site-per-process")
+            options.add_argument("--disable-site-isolation-trials")
             
             # 检测环境并配置
             chromium_paths = [
@@ -266,6 +296,11 @@ class DataCollector:
             })
             
             self.driver.set_page_load_timeout(30)
+            
+            # 新增：初始化 Session（先访问首页）
+            if not self.session_initialized:
+                self._init_session()
+            
             return self.driver
             
         except Exception as e:
@@ -273,6 +308,17 @@ class DataCollector:
             import traceback
             self._log(traceback.format_exc()[:200])
             return None
+
+    def _init_session(self):
+        """初始化 Session：访问首页建立 Cookie"""
+        try:
+            self._log("🍪 初始化 Session...")
+            self.driver.get("https://live.500.com/")
+            time.sleep(random.uniform(3, 5))
+            self._log("✅ Session 初始化完成")
+            self.session_initialized = True
+        except Exception as e:
+            self._log(f"⚠️ Session 初始化失败: {e}")
 
     def close(self):
         if self.driver:
@@ -283,9 +329,15 @@ class DataCollector:
             self.driver = None
 
     def get_page_with_retry(self, url, wait=3, max_retries=3):
-        """带重试的页面获取"""
+        """带重试的页面获取 - 增加延迟"""
         for i in range(max_retries):
             try:
+                # 随机延迟前检查是否需要强制冷却
+                self._cool_down_if_needed()
+                
+                # 随机延迟
+                delay = self._random_delay(2, 5)
+                
                 driver = self.get_driver()
                 if not driver:
                     time.sleep(2)
@@ -436,7 +488,7 @@ class DataCollector:
         return df
 
     def fetch_all_odds(self, match_id: str, log_callback=None) -> Dict:
-        """获取所有四种赔率"""
+        """获取所有四种赔率 - 增加长延迟"""
         if log_callback:
             self.set_log_callback(log_callback)
 
@@ -457,7 +509,9 @@ class DataCollector:
         except Exception as e:
             self._log(f"❌ [1/4] 欧洲赔率获取失败: {str(e)[:50]}")
 
-        time.sleep(0.5)
+        # 长延迟 5-10 秒
+        delay = self._random_delay(5, 10)
+        self._log(f"⏳ 等待 {delay:.1f} 秒...")
 
         # 2. 亚盘
         self._log(f"📊 [2/4] 开始获取亚盘数据...")
@@ -467,7 +521,9 @@ class DataCollector:
         except Exception as e:
             self._log(f"❌ [2/4] 亚盘获取失败: {str(e)[:50]}")
 
-        time.sleep(0.5)
+        # 长延迟 5-10 秒
+        delay = self._random_delay(5, 10)
+        self._log(f"⏳ 等待 {delay:.1f} 秒...")
 
         # 3. 让球胜平负
         self._log(f"📊 [3/4] 开始获取让球胜平负...")
@@ -477,7 +533,9 @@ class DataCollector:
         except Exception as e:
             self._log(f"❌ [3/4] 让球获取失败: {str(e)[:50]}")
 
-        time.sleep(0.5)
+        # 长延迟 5-10 秒
+        delay = self._random_delay(5, 10)
+        self._log(f"⏳ 等待 {delay:.1f} 秒...")
 
         # 4. 大小球
         self._log(f"📊 [4/4] 开始获取大小球数据...")
@@ -694,7 +752,7 @@ class DataCollector:
         return companies
 
     def batch_fetch_history(self, start_date: str, days: int = 7, progress_callback=None, log_callback=None) -> pd.DataFrame:
-        """批量获取历史数据"""
+        """批量获取历史数据 - 增加日期间隔"""
         if log_callback:
             self.set_log_callback(log_callback)
 
@@ -709,6 +767,12 @@ class DataCollector:
 
             if progress_callback:
                 progress_callback(i+1, days, date_str, "获取比赛列表...")
+
+            # 日期间隔：每天之间等待 10-20 秒
+            if i > 0:
+                day_delay = random.uniform(10, 20)
+                self._log(f"⏳ 日期间隔等待 {day_delay:.1f} 秒...")
+                time.sleep(day_delay)
 
             matches = self.fetch_matches_by_date(date_str, only_finished=True)
 
@@ -729,14 +793,16 @@ class DataCollector:
                     match_data.update(odds)
                     match_list.append(match_data)
 
-                    time.sleep(0.2)
+                    # 每场比赛之间等待 8-15 秒
+                    if idx < len(matches) - 1:  # 最后一场不需要等
+                        match_delay = random.uniform(8, 15)
+                        self._log(f"⏳ 比赛间隔等待 {match_delay:.1f} 秒...")
+                        time.sleep(match_delay)
 
                 all_matches.extend(match_list)
                 self._log(f"✅ {date_str} 完成，共 {len(match_list)} 场")
             else:
                 self._log(f"⚠️ {date_str} 无完赛数据")
-
-            time.sleep(0.5)
 
         df = pd.DataFrame(all_matches)
         if not df.empty:
@@ -834,7 +900,7 @@ class DataCollector:
         return df
 
     def fetch_future_matches_with_odds(self, date_str: str, progress_callback=None, log_callback=None) -> pd.DataFrame:
-        """获取未来比赛并获取赔率数据"""
+        """获取未来比赛并获取赔率数据 - 增加延迟"""
         if log_callback:
             self.set_log_callback(log_callback)
 
@@ -860,7 +926,11 @@ class DataCollector:
             match_data.update(odds)
             match_list.append(match_data)
 
-            time.sleep(0.2)
+            # 每场比赛之间等待 8-15 秒
+            if idx < len(matches) - 1:
+                match_delay = random.uniform(8, 15)
+                self._log(f"⏳ 比赛间隔等待 {match_delay:.1f} 秒...")
+                time.sleep(match_delay)
 
         df = pd.DataFrame(match_list)
         if not df.empty:
@@ -1340,14 +1410,10 @@ class DeepLearningModel:
         labels = ['主胜', '平局', '客胜']
         pred_idx = np.argmax(ensemble_pred)
         
-        # 排序获取 Top 3
         sorted_indices = np.argsort(ensemble_pred)[::-1]
         top3_results = [(labels[i], round(ensemble_pred[i] * 100, 2)) for i in sorted_indices]
         
-        # 预测比分
         score_predictions = self._predict_scores(ensemble_pred[0], ensemble_pred[1], ensemble_pred[2])
-        
-        # 预测总进球
         total_goals_predictions = self._predict_total_goals(ensemble_pred[0], ensemble_pred[1], ensemble_pred[2])
         
         return {
@@ -1688,7 +1754,7 @@ def main():
     </style>
     """, unsafe_allow_html=True)
     
-    st.markdown('<div class="main-header">⚽ 足球智能预测系统 v5.2<br><small>云端优化版</small></div>', unsafe_allow_html=True)
+    st.markdown('<div class="main-header">⚽ 足球智能预测系统 v5.2<br><small>反爬优化版</small></div>', unsafe_allow_html=True)
     
     if 'system' not in st.session_state:
         with st.spinner("系统初始化中..."):
@@ -1702,7 +1768,8 @@ def main():
         
         # 显示环境信息
         if is_cloud:
-            st.info("☁️ 云端运行模式")
+            st.info("☁️ 云端运行模式（已优化反爬）")
+            st.warning("⚠️ 云端抓取较慢，请耐心等待")
         else:
             st.info("💻 本地运行模式")
         
@@ -1722,7 +1789,7 @@ def main():
                 st.markdown("📋 **获取日志**")
                 log_html = "<div style='height: 120px; overflow-y: auto; border: 1px solid #e0e0e0; border-radius: 5px; padding: 8px; background-color: #f8f9fa; font-family: monospace; font-size: 10px; line-height: 1.6;'>"
                 for log in st.session_state['fetch_logs'][-50:]:
-                    color = '#0066cc' if '📡' in log else '#28a745' if '✅' in log else '#dc3545' if '❌' in log else '#333'
+                    color = '#0066cc' if '📡' in log else '#28a745' if '✅' in log else '#dc3545' if '❌' in log else '#fd7e14' if '⏳' in log else '#333'
                     log_html += f"<div style='color: {color}; margin-bottom: 2px;'>{log}</div>"
                 log_html += "</div>"
                 st.markdown(log_html, unsafe_allow_html=True)
@@ -1746,7 +1813,7 @@ def main():
                 if len(st.session_state['fetch_logs']) > 100:
                     st.session_state['fetch_logs'] = st.session_state['fetch_logs'][-100:]
 
-            with st.spinner("获取未来比赛中..."):
+            with st.spinner("获取未来比赛中...（请耐心等待，已增加延迟）"):
                 success, msg = system.collect_future_matches(
                     future_date.strftime('%Y-%m-%d'),
                     update_progress,
@@ -1781,7 +1848,7 @@ def main():
                 if len(st.session_state['fetch_logs']) > 100:
                     st.session_state['fetch_logs'] = st.session_state['fetch_logs'][-100:]
             
-            with st.spinner("获取中..."):
+            with st.spinner("获取中...（请耐心等待，已增加延迟）"):
                 success, msg = system.batch_collect_training_data(
                     start_date.strftime('%Y-%m-%d'),
                     int(days),
