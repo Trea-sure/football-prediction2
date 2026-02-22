@@ -1,5 +1,5 @@
-# ==================== 足球智能预测系统 v5.2 - 云端版 ====================
-# 优化：使用requests代替Selenium，适合云端部署
+# ==================== 足球智能预测系统 v5.2 (Cloud Edition) ====================
+# 优化：适配 Streamlit Cloud，修复 Selenium 配置
 
 import streamlit as st
 import requests
@@ -34,6 +34,12 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 
+# 爬虫
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from bs4 import BeautifulSoup
+
 # 可视化
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -42,10 +48,10 @@ from plotly.subplots import make_subplots
 
 @dataclass
 class Config:
-    DATA_FILE: str = "/tmp/football_training_data.json"
-    MODEL_DIR: str = "/tmp/models_v5"
+    DATA_FILE: str = "football_training_data.json"
+    MODEL_DIR: str = "models_v5"
     MIN_TRAIN_SAMPLES: int = 30
-
+    
     def __post_init__(self):
         os.makedirs(self.MODEL_DIR, exist_ok=True)
 
@@ -54,41 +60,119 @@ CONFIG = Config()
 # ==================== 数据持久化管理 ====================
 
 class DataPersistence:
-    """数据持久化管理器 - 云端版"""
+    """数据持久化管理器 - 自动保存到本地"""
+
+    DATA_FILE = "football_data_cache.json"
 
     def __init__(self):
-        self.data = []
+        self.data = self._load_data()
 
-    def save_data(self, data):
-        """保存数据到云端存储"""
+    def _load_data(self):
+        """从本地加载数据"""
+        if os.path.exists(self.data_file):
+            try:
+                with open(self.data_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                print(f"📂 从本地加载了 {len(data)} 场比赛数据")
+
+                # 转换为DataFrame
+                df = pd.DataFrame(data)
+
+                # 解析JSON字符串为列表
+                for col in ['europe', 'asia', 'daxiao', 'handicap']:
+                    if col in df.columns:
+                        df[col] = df[col].apply(
+                            lambda x: json.loads(x) if isinstance(x, str) and x.strip() else 
+                                     (x if isinstance(x, list) else [])
+                        )
+
+                # 确保必要列存在
+                required_cols = ['match_id', 'date', 'league', 'time', 'home_team', 'away_team', 'actual_result']
+                for col in required_cols:
+                    if col not in df.columns:
+                        df[col] = ''
+
+                return df
+            except Exception as e:
+                print(f"⚠️ 加载本地数据失败: {e}")
+
+        # 返回空DataFrame
+        return pd.DataFrame(columns=[
+            'match_id', 'date', 'league', 'time', 'status', 'home_team', 'away_team',
+            'score', 'score_home', 'score_away', 'actual_result', 'has_result',
+            'europe', 'asia', 'daxiao', 'handicap', 'order'
+        ])
+
+    def save_data(self):
+        """保存数据到本地"""
         try:
-            with open(CONFIG.DATA_FILE, 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
+            with open(self.DATA_FILE, 'w', encoding='utf-8') as f:
+                json.dump(self.data, f, ensure_ascii=False, indent=2)
             return True
         except Exception as e:
-            print(f"保存数据失败: {e}")
+            print(f"❌ 保存数据失败: {e}")
             return False
 
-    def load_data(self):
-        """从云端存储加载数据"""
-        if os.path.exists(CONFIG.DATA_FILE):
-            try:
-                with open(CONFIG.DATA_FILE, 'r', encoding='utf-8') as f:
-                    return json.load(f)
-            except Exception as e:
-                print(f"加载数据失败: {e}")
-        return []
+    def add_matches(self, matches):
+        """批量添加比赛"""
+        added, updated = 0, 0
+        for match in matches:
+            match_id = match.get('match_id')
+            existing_idx = None
+            for idx, m in enumerate(self.data):
+                if m.get('match_id') == match_id:
+                    existing_idx = idx
+                    break
 
-# ==================== 数据采集模块（云端版-使用requests） ====================
+            if existing_idx is not None:
+                existing = self.data[existing_idx]
+                for key in ['europe', 'asia', 'handicap', 'daxiao']:
+                    if key in match and match[key]:
+                        existing[key] = match[key]
+                for key, value in match.items():
+                    if key not in ['europe', 'asia', 'handicap', 'daxiao']:
+                        existing[key] = value
+                self.data[existing_idx] = existing
+                updated += 1
+            else:
+                self.data.append(match)
+                added += 1
+
+        self.save_data()
+        return added, updated
+
+    def get_trainable_matches(self):
+        """获取可用于训练的比赛"""
+        result = []
+        for m in self.data:
+            has_result = m.get('actual_result') in ['主胜', '平局', '客胜']
+            has_odds = any(len(m.get(ot, []) or []) > 0 for ot in ['europe', 'asia', 'handicap', 'daxiao'])
+            if has_result and has_odds:
+                result.append(m)
+        return result
+
+    def get_statistics(self):
+        """获取统计"""
+        trainable = self.get_trainable_matches()
+        result_dist = {"主胜": 0, "平局": 0, "客胜": 0}
+        for m in trainable:
+            r = m.get('actual_result')
+            if r in result_dist:
+                result_dist[r] += 1
+        return {
+            'total': len(self.data),
+            'trainable': len(trainable),
+            'result_distribution': result_dist
+        }
+
+
+# ==================== 数据采集模块 (Cloud Optimized) ====================
 
 class DataCollector:
-    """云端版数据采集器，使用requests代替Selenium"""
+    """适配云端的修复版数据采集器"""
 
     def __init__(self):
-        self.session = requests.Session()
-        self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-        })
+        self.driver = None
         self.base_urls = {
             'live': "https://live.500.com/",
             'europe': "https://odds.500.com/fenxi/ouzhi-{}.shtml",
@@ -106,21 +190,134 @@ class DataCollector:
             self.log_callback(message)
         print(message)
 
-    def get_page(self, url, wait=3):
-        """使用requests获取页面"""
+    def get_driver(self):
+        """获取配置好的 Chrome WebDriver - 支持本地和云端环境"""
+        if self.driver is not None:
+            try:
+                self.driver.current_url
+                return self.driver
+            except:
+                self.close()
+
         try:
-            response = self.session.get(url, timeout=30)
-            response.encoding = 'gb2312'
-            time.sleep(wait)
-            return response.text
+            options = Options()
+            
+            # 无头模式（必须）
+            options.add_argument("--headless=new")
+            options.add_argument("--no-sandbox")
+            options.add_argument("--disable-dev-shm-usage")
+            options.add_argument("--disable-gpu")
+            options.add_argument("--disable-features=NetworkService")
+            options.add_argument("--window-size=1920,1080")
+            options.add_argument("--disable-features=VizDisplayCompositor")
+            
+            # 反检测设置
+            options.add_argument("--disable-blink-features=AutomationControlled")
+            options.add_experimental_option("excludeSwitches", ["enable-automation"])
+            options.add_experimental_option('useAutomationExtension', False)
+            
+            # 设置 User-Agent
+            options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.0")
+            
+            # 禁用图片加载（加速）
+            options.add_experimental_option("prefs", {"profile.managed_default_content_settings.images": 2})
+            
+            # 检测环境并配置
+            chromium_paths = [
+                '/usr/bin/chromium',
+                '/usr/bin/chromium-browser',
+                '/usr/lib/chromium/chromium'
+            ]
+            
+            chromedriver_paths = [
+                '/usr/bin/chromedriver',
+                '/usr/lib/chromium/chromedriver',
+                '/usr/local/bin/chromedriver'
+            ]
+            
+            chromium_binary = None
+            for path in chromium_paths:
+                if os.path.exists(path):
+                    chromium_binary = path
+                    break
+            
+            chromedriver_binary = None
+            for path in chromedriver_paths:
+                if os.path.exists(path):
+                    chromedriver_binary = path
+                    break
+            
+            if chromium_binary and chromedriver_binary:
+                # 云端环境
+                self._log(f"☁️ 使用云端 Chromium: {chromium_binary}")
+                options.binary_location = chromium_binary
+                service = Service(chromedriver_binary)
+                self.driver = webdriver.Chrome(service=service, options=options)
+            else:
+                # 本地环境
+                self._log("💻 使用本地 Chrome")
+                from webdriver_manager.chrome import ChromeDriverManager
+                service = Service(ChromeDriverManager().install())
+                self.driver = webdriver.Chrome(service=service, options=options)
+            
+            # 隐藏 webdriver 属性
+            self.driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
+                'source': 'Object.defineProperty(navigator, "webdriver", {get: () => undefined})'
+            })
+            
+            self.driver.set_page_load_timeout(30)
+            return self.driver
+            
         except Exception as e:
-            self._log(f"获取页面失败: {str(e)[:50]}")
+            self._log(f"❌ 浏览器创建失败: {str(e)[:100]}")
+            import traceback
+            self._log(traceback.format_exc()[:200])
             return None
 
-    def fetch_matches_by_date(self, date_str: str, only_finished: bool = True) -> pd.DataFrame:
-        """【云端版】获取指定日期的比赛数据"""
-        from bs4 import BeautifulSoup
+    def close(self):
+        if self.driver:
+            try:
+                self.driver.quit()
+            except:
+                pass
+            self.driver = None
 
+    def get_page_with_retry(self, url, wait=3, max_retries=3):
+        """带重试的页面获取"""
+        for i in range(max_retries):
+            try:
+                driver = self.get_driver()
+                if not driver:
+                    time.sleep(2)
+                    continue
+                    
+                driver.get(url)
+                time.sleep(wait)
+                
+                # 滚动页面确保加载完成
+                for _ in range(2):
+                    driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+                    time.sleep(0.5)
+                
+                return driver.page_source
+                
+            except Exception as e:
+                self._log(f"⚠️ 第 {i+1} 次尝试失败: {str(e)[:50]}")
+                self.close()
+                time.sleep(3)
+                
+                if i == max_retries - 1:
+                    self._log(f"❌ 最终失败: {url}")
+                    return None
+        
+        return None
+
+    def get_page(self, url, wait=3):
+        """获取页面"""
+        return self.get_page_with_retry(url, wait, max_retries=3)
+
+    def fetch_matches_by_date(self, date_str: str, only_finished: bool = True) -> pd.DataFrame:
+        """获取指定日期的比赛数据"""
         html = self.get_page(f"{self.base_urls['live']}?e={date_str}", wait=4)
         if not html:
             return pd.DataFrame()
@@ -160,7 +357,6 @@ class DataCollector:
                     if time_match:
                         match_time = time_match.group(1)
 
-                # 提取比分
                 score_home, score_away, actual_result = "", "", ""
                 if status == "完":
                     pk_div = tr.find("div", class_="pk")
@@ -168,22 +364,28 @@ class DataCollector:
                         all_links = pk_div.find_all("a")
                         if len(all_links) >= 3:
                             try:
-                                home_val = int(all_links[0].get_text(strip=True))
-                                away_val = int(all_links[2].get_text(strip=True))
+                                home_text = all_links[0].get_text(strip=True)
+                                away_text = all_links[2].get_text(strip=True)
+                                home_val = int(home_text)
+                                away_val = int(away_text)
                                 if 0 <= home_val <= 20 and 0 <= away_val <= 20:
                                     score_home = str(home_val)
                                     score_away = str(away_val)
-
-                                    if home_val > away_val:
-                                        actual_result = "主胜"
-                                    elif home_val < away_val:
-                                        actual_result = "客胜"
-                                    else:
-                                        actual_result = "平局"
                             except:
                                 pass
 
-                # 提取球队
+                    if score_home and score_away:
+                        try:
+                            sh, sa = int(score_home), int(score_away)
+                            if sh > sa:
+                                actual_result = "主胜"
+                            elif sh < sa:
+                                actual_result = "客胜"
+                            else:
+                                actual_result = "平局"
+                        except:
+                            pass
+
                 teams = []
                 for t_idx in [5, 7]:
                     if t_idx < len(tds):
@@ -200,7 +402,7 @@ class DataCollector:
                         text = td.get_text(strip=True)
                         if (2 <= len(text) <= 15 and 
                             not any(c.isdigit() for c in text) and
-                            text not in ['主', '客', 'vs', '-', ':']):
+                            text not in ['主', '客', 'vs', '-', ':', '半球', '平手', '受半球', '受平手', '一球']):
                             if text not in teams:
                                 teams.append(text)
                         if len(teams) >= 2:
@@ -233,57 +435,8 @@ class DataCollector:
             df = df.sort_values('order').reset_index(drop=True)
         return df
 
-    def fetch_odds_from_page(self, match_id: str, odds_type: str = 'europe') -> List[Dict]:
-        """【云端版】从页面提取赔率数据"""
-        from bs4 import BeautifulSoup
-
-        url = self.base_urls[odds_type].format(match_id)
-        self._log(f"📡 {url}")
-
-        html = self.get_page(url, wait=2)
-        if not html:
-            return []
-
-        soup = BeautifulSoup(html, 'lxml')
-        companies = []
-
-        try:
-            # 查找隐藏的input元素
-            row_input = soup.find('input', {'name': 'row'})
-            if row_input:
-                row_value = row_input.get('value', '')
-                if row_value:
-                    company_rows = row_value.split('|')
-
-                    for row in company_rows:
-                        if not row or '公司' in row or '平均' in row:
-                            continue
-
-                        parts = row.split(',')
-                        if len(parts) >= 7:
-                            try:
-                                company = {
-                                    'company': parts[0].strip(),
-                                    'init_home': float(parts[1]),
-                                    'init_draw': float(parts[2]),
-                                    'init_away': float(parts[3]),
-                                    'live_home': float(parts[4]),
-                                    'live_draw': float(parts[5]),
-                                    'live_away': float(parts[6]),
-                                }
-                                company['change_home'] = round(company['live_home'] - company['init_home'], 2)
-                                company['change_draw'] = round(company['live_draw'] - company['init_draw'], 2)
-                                company['change_away'] = round(company['live_away'] - company['init_away'], 2)
-                                companies.append(company)
-                            except:
-                                continue
-        except Exception as e:
-            self._log(f"❌ 提取赔率失败: {str(e)[:50]}")
-
-        return companies
-
     def fetch_all_odds(self, match_id: str, log_callback=None) -> Dict:
-        """【云端版】获取所有四种赔率"""
+        """获取所有四种赔率"""
         if log_callback:
             self.set_log_callback(log_callback)
 
@@ -296,27 +449,252 @@ class DataCollector:
 
         self._log(f"🔄 开始获取比赛 {match_id} 的4种赔率...")
 
-        for i, (odds_type, name) in enumerate([
-            ('europe', '欧洲赔率'),
-            ('asia', '亚盘'),
-            ('handicap', '让球'),
-            ('daxiao', '大小球')
-        ], 1):
-            self._log(f"📊 [{i}/4] 开始获取{name}...")
-            try:
-                odds_data[odds_type] = self.fetch_odds_from_page(match_id, odds_type)
-                self._log(f"✓ [{i}/4] {name}: {len(odds_data[odds_type])} 家公司")
-            except Exception as e:
-                self._log(f"❌ [{i}/4] {name}获取失败: {str(e)[:50]}")
-            time.sleep(0.5)
+        # 1. 欧洲赔率
+        self._log(f"📊 [1/4] 开始获取欧洲赔率...")
+        try:
+            odds_data['europe'] = self._fetch_europe_odds(match_id)
+            self._log(f"✓ [1/4] 欧洲赔率: {len(odds_data['europe'])} 家公司")
+        except Exception as e:
+            self._log(f"❌ [1/4] 欧洲赔率获取失败: {str(e)[:50]}")
+
+        time.sleep(0.5)
+
+        # 2. 亚盘
+        self._log(f"📊 [2/4] 开始获取亚盘数据...")
+        try:
+            odds_data['asia'] = self._fetch_asia_odds(match_id)
+            self._log(f"✓ [2/4] 亚盘: {len(odds_data['asia'])} 家公司")
+        except Exception as e:
+            self._log(f"❌ [2/4] 亚盘获取失败: {str(e)[:50]}")
+
+        time.sleep(0.5)
+
+        # 3. 让球胜平负
+        self._log(f"📊 [3/4] 开始获取让球胜平负...")
+        try:
+            odds_data['handicap'] = self._fetch_handicap_odds(match_id)
+            self._log(f"✓ [3/4] 让球: {len(odds_data['handicap'])} 家公司")
+        except Exception as e:
+            self._log(f"❌ [3/4] 让球获取失败: {str(e)[:50]}")
+
+        time.sleep(0.5)
+
+        # 4. 大小球
+        self._log(f"📊 [4/4] 开始获取大小球数据...")
+        try:
+            odds_data['daxiao'] = self._fetch_daxiao_odds(match_id)
+            self._log(f"✓ [4/4] 大小球: {len(odds_data['daxiao'])} 家公司")
+        except Exception as e:
+            self._log(f"❌ [4/4] 大小球获取失败: {str(e)[:50]}")
 
         total = sum(len(v) for v in odds_data.values())
         self._log(f"✅ 总计: {total} 条赔率数据")
 
         return odds_data
 
+    def _fetch_europe_odds(self, match_id: str) -> List[Dict]:
+        """获取欧洲赔率"""
+        url = f"https://odds.500.com/fenxi/ouzhi-{match_id}.shtml"
+        self._log(f"      🌐 访问: {url}")
+
+        html = self.get_page(url, wait=4)
+        if not html:
+            return []
+
+        soup = BeautifulSoup(html, 'lxml')
+        companies = []
+
+        try:
+            rows = soup.find_all('tr', {'class': ['tr1', 'tr2']})
+            
+            for tr in rows:
+                try:
+                    company_name = ""
+                    name_td = tr.find('td', {'class': 'tb_plgs'})
+                    if name_td:
+                        span = name_td.find('span', {'class': 'quancheng'})
+                        if span:
+                            company_name = span.get_text(strip=True)
+
+                    if not company_name or any(x in company_name for x in ['平均', '最大', '最小']):
+                        continue
+
+                    tds = tr.find_all('td', recursive=False)
+                    if len(tds) < 3:
+                        continue
+
+                    odds_td = tds[2]
+                    inner_table = odds_td.find('table', {'class': 'pl_table_data'})
+                    if not inner_table:
+                        continue
+
+                    inner_rows = inner_table.find_all('tr')
+                    if len(inner_rows) < 2:
+                        continue
+
+                    init_row = inner_rows[0]
+                    init_tds = init_row.find_all('td')
+                    if len(init_tds) < 3:
+                        continue
+
+                    init_home = self._parse_odds_value(init_tds[0])
+                    init_draw = self._parse_odds_value(init_tds[1])
+                    init_away = self._parse_odds_value(init_tds[2])
+
+                    live_row = inner_rows[1]
+                    live_tds = live_row.find_all('td')
+                    if len(live_tds) < 3:
+                        continue
+
+                    live_home = self._parse_odds_value(live_tds[0])
+                    live_draw = self._parse_odds_value(live_tds[1])
+                    live_away = self._parse_odds_value(live_tds[2])
+
+                    if all(v > 0 for v in [init_home, init_draw, init_away, live_home, live_draw, live_away]):
+                        companies.append({
+                            'company': company_name,
+                            'init_home': round(init_home, 2),
+                            'init_draw': round(init_draw, 2),
+                            'init_away': round(init_away, 2),
+                            'live_home': round(live_home, 2),
+                            'live_draw': round(live_draw, 2),
+                            'live_away': round(live_away, 2),
+                            'change_home': round(live_home - init_home, 2),
+                            'change_draw': round(live_draw - init_draw, 2),
+                            'change_away': round(live_away - init_away, 2)
+                        })
+
+                except:
+                    continue
+
+        except Exception as e:
+            self._log(f"      ❌ 提取失败: {str(e)[:50]}")
+
+        return companies
+
+    def _parse_odds_value(self, td) -> float:
+        """从td元素解析赔率值"""
+        try:
+            text = td.get_text(strip=True)
+            text = re.sub(r'[↑↓]', '', text).strip()
+            return float(text)
+        except:
+            return 0.0
+
+    def _fetch_asia_odds(self, match_id: str) -> List[Dict]:
+        """获取亚盘数据"""
+        url = f"https://odds.500.com/fenxi/yazhi-{match_id}.shtml"
+        html = self.get_page(url, wait=3)
+        if not html:
+            return []
+
+        soup = BeautifulSoup(html, 'lxml')
+        companies = []
+
+        try:
+            row_input = soup.find('input', {'name': 'row'})
+            if row_input:
+                row_value = row_input.get('value', '')
+                if row_value:
+                    for row in row_value.split('|'):
+                        if not row or '公司' in row:
+                            continue
+                        parts = row.split(',')
+                        if len(parts) >= 7:
+                            try:
+                                companies.append({
+                                    'company': parts[0].strip(),
+                                    'init_home': float(parts[1]),
+                                    'init_handicap': parts[2].strip(),
+                                    'init_away': float(parts[3]),
+                                    'live_home': float(parts[4]),
+                                    'live_handicap': parts[5].strip(),
+                                    'live_away': float(parts[6])
+                                })
+                            except:
+                                continue
+        except:
+            pass
+
+        return companies
+
+    def _fetch_handicap_odds(self, match_id: str) -> List[Dict]:
+        """获取让球胜平负"""
+        url = f"https://odds.500.com/fenxi/rangqiu-{match_id}.shtml"
+        html = self.get_page(url, wait=3)
+        if not html:
+            return []
+
+        soup = BeautifulSoup(html, 'lxml')
+        companies = []
+
+        try:
+            row_input = soup.find('input', {'name': 'row'})
+            if row_input:
+                row_value = row_input.get('value', '')
+                if row_value:
+                    for row in row_value.split('|'):
+                        if not row or '公司' in row:
+                            continue
+                        parts = row.split(',')
+                        if len(parts) >= 8:
+                            try:
+                                companies.append({
+                                    'company': parts[0].strip(),
+                                    'handicap': parts[1].strip(),
+                                    'init_home': float(parts[2]),
+                                    'init_draw': float(parts[3]),
+                                    'init_away': float(parts[4]),
+                                    'live_home': float(parts[5]),
+                                    'live_draw': float(parts[6]),
+                                    'live_away': float(parts[7])
+                                })
+                            except:
+                                continue
+        except:
+            pass
+
+        return companies
+
+    def _fetch_daxiao_odds(self, match_id: str) -> List[Dict]:
+        """获取大小球数据"""
+        url = f"https://odds.500.com/fenxi/daxiao-{match_id}.shtml"
+        html = self.get_page(url, wait=3)
+        if not html:
+            return []
+
+        soup = BeautifulSoup(html, 'lxml')
+        companies = []
+
+        try:
+            row_input = soup.find('input', {'name': 'row'})
+            if row_input:
+                row_value = row_input.get('value', '')
+                if row_value:
+                    for row in row_value.split('|'):
+                        if not row or '公司' in row:
+                            continue
+                        parts = row.split(',')
+                        if len(parts) >= 7:
+                            try:
+                                companies.append({
+                                    'company': parts[0].strip(),
+                                    'init_over': float(parts[1]),
+                                    'init_line': parts[2].strip(),
+                                    'init_under': float(parts[3]),
+                                    'live_over': float(parts[4]),
+                                    'live_line': parts[5].strip(),
+                                    'live_under': float(parts[6])
+                                })
+                            except:
+                                continue
+        except:
+            pass
+
+        return companies
+
     def batch_fetch_history(self, start_date: str, days: int = 7, progress_callback=None, log_callback=None) -> pd.DataFrame:
-        """【云端版】批量获取历史数据"""
+        """批量获取历史数据"""
         if log_callback:
             self.set_log_callback(log_callback)
 
@@ -366,9 +744,7 @@ class DataCollector:
         return df
 
     def fetch_future_matches(self, date_str: str) -> pd.DataFrame:
-        """【云端版】获取未来比赛"""
-        from bs4 import BeautifulSoup
-
+        """获取指定日期的未来比赛"""
         html = self.get_page(f"{self.base_urls['live']}?e={date_str}", wait=4)
         if not html:
             return pd.DataFrame()
@@ -458,7 +834,7 @@ class DataCollector:
         return df
 
     def fetch_future_matches_with_odds(self, date_str: str, progress_callback=None, log_callback=None) -> pd.DataFrame:
-        """【云端版】获取未来比赛并获取赔率"""
+        """获取未来比赛并获取赔率数据"""
         if log_callback:
             self.set_log_callback(log_callback)
 
@@ -493,10 +869,11 @@ class DataCollector:
         self._log(f"✅ {date_str} 完成，共 {len(df)} 场")
         return df
 
+
 # ==================== 特征工程 ====================
 
 class FeatureEngineer:
-    """特征工程 - 云端版"""
+    """特征工程"""
 
     FEATURE_DIM = 85
 
@@ -581,7 +958,7 @@ class FeatureEngineer:
                 features.extend([0.0] * 14)
 
             return features[:35]
-        except Exception as e:
+        except:
             return [0.0] * 35
 
     def _asia_features(self, asia_odds):
@@ -629,7 +1006,7 @@ class FeatureEngineer:
                 features.extend([0.0] * 7)
 
             return features[:15]
-        except Exception as e:
+        except:
             return [0.0] * 15
 
     def _handicap_features(self, handicap_odds):
@@ -661,7 +1038,7 @@ class FeatureEngineer:
                 features.extend([0.0, 0.0])
 
             return features[:10]
-        except Exception as e:
+        except:
             return [0.0] * 10
 
     def _daxiao_features(self, daxiao_odds):
@@ -706,7 +1083,7 @@ class FeatureEngineer:
                 features.extend([0.0] * 4)
 
             return features[:12]
-        except Exception as e:
+        except:
             return [0.0] * 12
 
     def _meta_features(self, match_data):
@@ -800,6 +1177,37 @@ class FeatureEngineer:
         X = np.array(X)
         y_labels = np.array(y_labels)
 
+        unique_classes = np.unique(y_labels)
+        class_counts = np.bincount(y_labels, minlength=3)
+
+        if len(unique_classes) < 2:
+            return np.array([]), np.array([]), []
+
+        min_count = min(class_counts[class_counts > 0])
+        if min_count < 5:
+            X_new, y_new, meta_new = [], [], []
+
+            for cls in range(3):
+                mask = y_labels == cls
+                X_cls = X[mask]
+                y_cls = y_labels[mask]
+                meta_cls = [metadata[i] for i in range(len(metadata)) if mask[i]]
+
+                if len(X_cls) > 0 and len(X_cls) < 5:
+                    repeat_times = (5 // len(X_cls)) + 1
+                    X_cls = np.repeat(X_cls, repeat_times, axis=0)[:10]
+                    y_cls = np.repeat(y_cls, repeat_times)[:10]
+                    meta_cls = (meta_cls * repeat_times)[:10]
+
+                if len(X_cls) > 0:
+                    X_new.extend(X_cls)
+                    y_new.extend(y_cls)
+                    meta_new.extend(meta_cls)
+
+            X = np.array(X_new)
+            y_labels = np.array(y_new)
+            metadata = meta_new
+
         y_onehot = np.zeros((len(y_labels), 3))
         for i, label in enumerate(y_labels):
             y_onehot[i, label] = 1
@@ -835,11 +1243,12 @@ class FeatureEngineer:
             self.scaler = data['scaler']
             self.is_fitted = data['is_fitted']
 
+
 # ==================== 深度学习模型 ====================
 
 class DeepLearningModel:
-    """深度学习模型 - 云端版"""
-
+    """深度学习模型"""
+    
     def __init__(self, input_dim=85):
         self.input_dim = input_dim
         self.dnn_model = None
@@ -847,14 +1256,14 @@ class DeepLearningModel:
         self.gbdt_model = None
         self.is_trained = False
         self.training_history = []
-
+    
     def build_models(self):
         if TF_AVAILABLE:
             self.dnn_model = self._build_dnn()
-
+        
         self.rf_model = RandomForestClassifier(n_estimators=200, max_depth=15, min_samples_split=5, random_state=42, n_jobs=-1)
         self.gbdt_model = GradientBoostingClassifier(n_estimators=150, learning_rate=0.05, max_depth=6, random_state=42)
-
+    
     def _build_dnn(self):
         model = Sequential([
             Dense(256, activation='relu', input_shape=(self.input_dim,)),
@@ -868,17 +1277,17 @@ class DeepLearningModel:
             Dropout(0.2),
             Dense(3, activation='softmax')
         ])
-
+        
         model.compile(optimizer=Adam(learning_rate=0.001), loss='categorical_crossentropy', metrics=['accuracy'])
         return model
-
+    
     def train(self, X, y, validation_split=0.2, epochs=100):
         if len(X) < 10:
             return False, "数据量不足"
-
+        
         results = {}
         X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=validation_split, random_state=42)
-
+        
         if TF_AVAILABLE and self.dnn_model:
             callbacks = [
                 EarlyStopping(patience=15, restore_best_weights=True, monitor='val_accuracy'),
@@ -891,65 +1300,65 @@ class DeepLearningModel:
                 'val_acc': max(history.history['val_accuracy'])
             }
             self.training_history.append(history.history)
-
+        
         y_train_labels = np.argmax(y_train, axis=1)
         y_val_labels = np.argmax(y_val, axis=1)
-
+        
         self.rf_model.fit(X_train, y_train_labels)
         results['rf'] = {
             'train_acc': self.rf_model.score(X_train, y_train_labels),
             'val_acc': self.rf_model.score(X_val, y_val_labels)
         }
-
+        
         self.gbdt_model.fit(X_train, y_train_labels)
         results['gbdt'] = {
             'train_acc': self.gbdt_model.score(X_train, y_train_labels),
             'val_acc': self.gbdt_model.score(X_val, y_val_labels)
         }
-
+        
         self.is_trained = True
         return True, results
-
+    
     def predict(self, X):
-        """预测 - 包括胜平负、比分、总进球数"""
         if not self.is_trained:
             return None
-
+        
         dnn_pred = None
         if TF_AVAILABLE and self.dnn_model:
             dnn_pred = self.dnn_model.predict(X.reshape(1, -1), verbose=0)[0]
-
+        
         rf_pred = self.rf_model.predict_proba(X.reshape(1, -1))[0]
         gbdt_pred = self.gbdt_model.predict_proba(X.reshape(1, -1))[0]
-
+        
         if dnn_pred is not None:
             ensemble_pred = 0.4 * dnn_pred + 0.3 * rf_pred + 0.3 * gbdt_pred
         else:
             ensemble_pred = 0.5 * rf_pred + 0.5 * gbdt_pred
-
+        
         ensemble_pred = ensemble_pred / ensemble_pred.sum()
-
+        
         labels = ['主胜', '平局', '客胜']
-
-        top3_indices = np.argsort(ensemble_pred)[-3:][::-1]
-        top3_results = [(labels[i], round(ensemble_pred[i] * 100, 2)) for i in top3_indices]
-
-        home_win_prob = ensemble_pred[0]
-        draw_prob = ensemble_pred[1]
-        away_win_prob = ensemble_pred[2]
-
-        score_predictions = self._predict_scores(home_win_prob, draw_prob, away_win_prob)
-        total_goals_predictions = self._predict_total_goals(home_win_prob, draw_prob, away_win_prob)
-
+        pred_idx = np.argmax(ensemble_pred)
+        
+        # 排序获取 Top 3
+        sorted_indices = np.argsort(ensemble_pred)[::-1]
+        top3_results = [(labels[i], round(ensemble_pred[i] * 100, 2)) for i in sorted_indices]
+        
+        # 预测比分
+        score_predictions = self._predict_scores(ensemble_pred[0], ensemble_pred[1], ensemble_pred[2])
+        
+        # 预测总进球
+        total_goals_predictions = self._predict_total_goals(ensemble_pred[0], ensemble_pred[1], ensemble_pred[2])
+        
         return {
-            'result': top3_results[0][0],
-            'confidence': top3_results[0][1],
-            'top3_results': top3_results,
+            'result': labels[pred_idx],
+            'confidence': round(ensemble_pred[pred_idx] * 100, 2),
             'probabilities': {labels[i]: round(ensemble_pred[i] * 100, 2) for i in range(3)},
+            'top3_results': top3_results,
             'score_predictions': score_predictions,
             'total_goals_predictions': total_goals_predictions
         }
-
+    
     def _predict_scores(self, home_win_prob, draw_prob, away_win_prob):
         """预测最可能的3个比分"""
         scores = []
@@ -1015,97 +1424,98 @@ class DeepLearningModel:
     def save(self, name='model_v5'):
         path = os.path.join(CONFIG.MODEL_DIR, name)
         os.makedirs(path, exist_ok=True)
-
+        
         if TF_AVAILABLE and self.dnn_model:
             self.dnn_model.save(os.path.join(path, 'dnn.h5'))
-
+        
         with open(os.path.join(path, 'rf.pkl'), 'wb') as f:
             pickle.dump(self.rf_model, f)
         with open(os.path.join(path, 'gbdt.pkl'), 'wb') as f:
             pickle.dump(self.gbdt_model, f)
-
+        
         with open(os.path.join(path, 'config.pkl'), 'wb') as f:
             pickle.dump({'is_trained': self.is_trained, 'training_history': self.training_history}, f)
-
+        
         return True
-
+    
     def load(self, name='model_v5'):
         path = os.path.join(CONFIG.MODEL_DIR, name)
-
+        
         if not os.path.exists(path):
             return False
-
+        
         try:
             if TF_AVAILABLE and os.path.exists(os.path.join(path, 'dnn.h5')):
                 self.dnn_model = load_model(os.path.join(path, 'dnn.h5'))
-
+            
             with open(os.path.join(path, 'rf.pkl'), 'rb') as f:
                 self.rf_model = pickle.load(f)
             with open(os.path.join(path, 'gbdt.pkl'), 'rb') as f:
                 self.gbdt_model = pickle.load(f)
-
+            
             with open(os.path.join(path, 'config.pkl'), 'rb') as f:
                 config = pickle.load(f)
                 self.is_trained = config['is_trained']
                 self.training_history = config['training_history']
-
+            
             return True
         except:
             return False
 
+
 # ==================== 主控制系统 ====================
 
 class FootballPredictionSystem:
-    """足球预测主系统 - 云端版"""
-
+    """足球预测主系统"""
+    
     def __init__(self):
         self.collector = DataCollector()
         self.feature_engineer = FeatureEngineer()
         self.model = DeepLearningModel(input_dim=FeatureEngineer.FEATURE_DIM)
         self.data_file = CONFIG.DATA_FILE
-
+        
         self.df = self._load_data()
-
+        
         if self.model.load():
             scaler_path = os.path.join(CONFIG.MODEL_DIR, 'scaler.pkl')
             if os.path.exists(scaler_path):
                 self.feature_engineer.load(scaler_path)
-
+    
     def _load_data(self):
         if os.path.exists(self.data_file):
             try:
                 with open(self.data_file, 'r', encoding='utf-8') as f:
                     data = json.load(f)
                 df = pd.DataFrame(data)
-
+                
                 required_cols = ['match_id', 'date', 'league', 'time', 'home_team', 'away_team', 'actual_result']
                 for col in required_cols:
                     if col not in df.columns:
                         df[col] = ''
-
+                
                 for col in ['europe', 'asia', 'daxiao', 'handicap']:
                     if col in df.columns:
                         df[col] = df[col].apply(lambda x: json.loads(x) if isinstance(x, str) else x if isinstance(x, list) else [])
                     else:
                         df[col] = [[] for _ in range(len(df))]
-
+                
                 return df
             except Exception as e:
                 print(f"加载数据失败: {e}")
-
+        
         return pd.DataFrame(columns=[
             'match_id', 'date', 'league', 'time', 'status', 'home_team', 'away_team',
             'score', 'score_home', 'score_away', 'actual_result', 'has_result',
             'europe', 'asia', 'daxiao', 'handicap', 'order'
         ])
-
+    
     def _save_data(self):
         try:
             if self.df.empty:
                 with open(self.data_file, 'w', encoding='utf-8') as f:
                     json.dump([], f, ensure_ascii=False, indent=2)
                 return True
-
+            
             df_copy = self.df.copy()
             for col in ['europe', 'asia', 'daxiao', 'handicap']:
                 if col in df_copy.columns:
@@ -1122,25 +1532,26 @@ class FootballPredictionSystem:
                             return json.dumps([], ensure_ascii=False)
 
                     df_copy[col] = df_copy[col].apply(serialize_odds)
-
+            
             with open(self.data_file, 'w', encoding='utf-8') as f:
                 json.dump(df_copy.to_dict('records'), f, ensure_ascii=False, indent=2)
+
             return True
         except Exception as e:
             print(f"保存数据失败: {e}")
             return False
-
+    
     def batch_collect_training_data(self, start_date: str, days: int = 7, progress_callback=None, log_callback=None):
         """批量收集训练数据"""
         new_df = self.collector.batch_fetch_history(start_date, days, progress_callback, log_callback)
-
+        
         if new_df.empty:
             return False, "未获取到数据"
-
+        
         if not self.df.empty and 'match_id' in self.df.columns:
             existing_ids = set(self.df['match_id'].tolist())
             new_df = new_df[~new_df['match_id'].isin(existing_ids)]
-
+        
         if not new_df.empty:
             for col in self.df.columns:
                 if col not in new_df.columns:
@@ -1148,22 +1559,22 @@ class FootballPredictionSystem:
                         new_df[col] = [[] for _ in range(len(new_df))]
                     else:
                         new_df[col] = ['' for _ in range(len(new_df))]
-
+            
             for col in new_df.columns:
                 if col not in self.df.columns:
                     if col in ['europe', 'asia', 'daxiao', 'handicap']:
                         self.df[col] = [[] for _ in range(len(self.df))]
                     else:
                         self.df[col] = ['' for _ in range(len(self.df))]
-
+            
             self.df = pd.concat([self.df, new_df], ignore_index=True)
             self._save_data()
-
+            
             has_result = len(new_df[new_df['actual_result'] != ''])
             has_odds = len(new_df[new_df['europe'].apply(lambda x: len(x) > 0 if isinstance(x, list) else False)])
-
+            
             return True, f"新增 {len(new_df)} 场（有结果: {has_result}场，有赔率: {has_odds}场），累计 {len(self.df)} 场"
-
+        
         return True, "所有数据已是最新"
 
     def collect_future_matches(self, date_str: str, progress_callback=None, log_callback=None):
@@ -1205,12 +1616,12 @@ class FootballPredictionSystem:
         """训练模型"""
         if self.df.empty or 'actual_result' not in self.df.columns:
             return False, "没有训练数据"
-
+        
         train_df = self.df[self.df['actual_result'].isin(['主胜', '平局', '客胜'])].copy()
-
+        
         if len(train_df) < CONFIG.MIN_TRAIN_SAMPLES:
             return False, f"需要至少{CONFIG.MIN_TRAIN_SAMPLES}场有结果的比赛，当前{len(train_df)}场"
-
+        
         has_odds_count = 0
         for idx, row in train_df.iterrows():
             for odds_type in ['europe', 'asia', 'handicap', 'daxiao']:
@@ -1218,85 +1629,107 @@ class FootballPredictionSystem:
                 if odds and len(odds) > 0:
                     has_odds_count += 1
                     break
-
+        
         if has_odds_count == 0:
             return False, f"有结果的比赛: {len(train_df)}场，但有赔率数据的: 0场。请确保成功获取了赔率信息。"
-
+        
         X, y, metadata = self.feature_engineer.prepare_training_data(train_df)
-
+        
         if len(X) == 0:
             return False, f"特征提取失败。有赔率的比赛: {has_odds_count}场，但无法提取有效特征。"
-
+        
         self.model.build_models()
         success, results = self.model.train(X, y)
-
+        
         if success:
             self.model.save()
             self.feature_engineer.save(os.path.join(CONFIG.MODEL_DIR, 'scaler.pkl'))
             return True, results
-
+        
         return False, results
-
+    
     def predict(self, match_data):
         """预测"""
         if not self.model.is_trained:
             return None, "模型未训练"
-
+        
         features = self.feature_engineer.transform(match_data)
         result = self.model.predict(features)
         return result, None
-
+    
     def get_stats(self):
         """获取统计"""
         if self.df.empty:
             return {'total': 0, 'trainable': 0, 'model_ready': self.model.is_trained}
-
+        
         if 'actual_result' not in self.df.columns:
             trainable = 0
         else:
-            has_result = self.df['actual_result'].isin(['主胜', '平局', '客胜'])
-
-            has_odds = pd.Series([False] * len(self.df))
-            for odds_type in ['europe', 'asia', 'handicap', 'daxiao']:
-                if odds_type in self.df.columns:
-                    has_odds |= self.df[odds_type].apply(
-                        lambda x: len(x) > 0 if isinstance(x, list) else False
-                    )
-
-            trainable = len(self.df[has_result & has_odds])
-
+            trainable = len(self.df[self.df['actual_result'].isin(['主胜', '平局', '客胜'])])
+        
         return {
             'total': len(self.df),
             'trainable': trainable,
             'model_ready': self.model.is_trained
         }
 
+
 # ==================== Streamlit UI ====================
 
 def main():
     st.set_page_config(page_title="⚽ 足球智能预测系统 v5.2", layout="wide")
-
+    
+    # 检测运行环境
+    is_cloud = os.path.exists('/mount') or os.path.exists('/usr/bin/chromium')
+    
     st.markdown("""
     <style>
     .main-header { font-size: 2.5rem; font-weight: bold; color: #1f77b4; text-align: center; }
     </style>
     """, unsafe_allow_html=True)
-
-    st.markdown('<div class="main-header">⚽ 足球智能预测系统 v5.2<br><small>云端部署版</small></div>', unsafe_allow_html=True)
-
+    
+    st.markdown('<div class="main-header">⚽ 足球智能预测系统 v5.2<br><small>云端优化版</small></div>', unsafe_allow_html=True)
+    
     if 'system' not in st.session_state:
         with st.spinner("系统初始化中..."):
             st.session_state['system'] = FootballPredictionSystem()
-
+    
     system = st.session_state['system']
     stats = system.get_stats()
-
+    
     with st.sidebar:
         st.header("🎛️ 控制面板")
-
+        
+        # 显示环境信息
+        if is_cloud:
+            st.info("☁️ 云端运行模式")
+        else:
+            st.info("💻 本地运行模式")
+        
+        st.subheader("📚 批量获取训练数据")
+        col_date, col_days = st.columns([2, 1])
+        with col_date:
+            start_date = st.date_input("开始日期", datetime.now() - timedelta(days=7))
+        with col_days:
+            days = st.number_input("天数", min_value=1, max_value=30, value=7)
+        
+        if 'fetch_logs' not in st.session_state:
+            st.session_state['fetch_logs'] = []
+        
+        log_area = st.empty()
+        if st.session_state['fetch_logs']:
+            with log_area.container():
+                st.markdown("📋 **获取日志**")
+                log_html = "<div style='height: 120px; overflow-y: auto; border: 1px solid #e0e0e0; border-radius: 5px; padding: 8px; background-color: #f8f9fa; font-family: monospace; font-size: 10px; line-height: 1.6;'>"
+                for log in st.session_state['fetch_logs'][-50:]:
+                    color = '#0066cc' if '📡' in log else '#28a745' if '✅' in log else '#dc3545' if '❌' in log else '#333'
+                    log_html += f"<div style='color: {color}; margin-bottom: 2px;'>{log}</div>"
+                log_html += "</div>"
+                st.markdown(log_html, unsafe_allow_html=True)
+        
         # 获取未来比赛
-        st.subheader("获取未来比赛（预测）")
-        future_date = st.date_input("选择比赛日期", datetime.now() + timedelta(days=1))
+        st.subheader("🔮 获取未来比赛")
+        future_date = st.date_input("选择比赛日期", datetime.now() + timedelta(days=1), key="future_date")
 
         if st.button("获取未来比赛", use_container_width=True, type="primary"):
             st.session_state['fetch_logs'] = []
@@ -1333,29 +1766,21 @@ def main():
 
         st.markdown("---")
 
-        # 批量获取训练数据
-        st.subheader("批量获取训练数据")
-        col_date, col_days = st.columns([2, 1])
-        with col_date:
-            start_date = st.date_input("开始日期", datetime.now() - timedelta(days=7))
-        with col_days:
-            days = st.number_input("天数", min_value=1, max_value=30, value=7)
-
-        if st.button("批量获取训练数据", use_container_width=True, type="primary"):
+        if st.button("🚀 批量获取训练数据", use_container_width=True, type="primary"):
             st.session_state['fetch_logs'] = []
-
+            
             progress_bar = st.progress(0)
             status_text = st.empty()
-
+            
             def update_progress(current_day, total_days, date_str, status):
                 progress_bar.progress(current_day / total_days)
                 status_text.text(f"[{current_day}/{total_days}] {date_str}: {status}")
-
+            
             def add_log(message):
                 st.session_state['fetch_logs'].append(message)
                 if len(st.session_state['fetch_logs']) > 100:
                     st.session_state['fetch_logs'] = st.session_state['fetch_logs'][-100:]
-
+            
             with st.spinner("获取中..."):
                 success, msg = system.batch_collect_training_data(
                     start_date.strftime('%Y-%m-%d'),
@@ -1363,26 +1788,25 @@ def main():
                     update_progress,
                     add_log
                 )
-
+            
             progress_bar.empty()
             status_text.empty()
-
+            
             if success:
                 st.success(msg)
                 st.balloons()
             else:
                 st.error(msg)
-
+            
             st.rerun()
-
+        
         st.markdown("---")
-
-        # 模型训练
-        st.subheader("模型训练")
+        
+        st.subheader("🧠 模型训练")
         trainable_count = stats['trainable']
-
+        
         if trainable_count >= CONFIG.MIN_TRAIN_SAMPLES:
-            st.success(f"可训练数据: {trainable_count}场")
+            st.success(f"✅ 可训练数据: {trainable_count}场")
             if st.button("开始训练模型", use_container_width=True, type="primary"):
                 with st.spinner("训练中..."):
                     success, result = system.train_model()
@@ -1392,16 +1816,16 @@ def main():
                     else:
                         st.error(result)
         else:
-            st.warning(f"需要{CONFIG.MIN_TRAIN_SAMPLES}场，当前{trainable_count}场")
+            st.warning(f"⚠️ 需要{CONFIG.MIN_TRAIN_SAMPLES}场，当前{trainable_count}场")
             st.progress(trainable_count / CONFIG.MIN_TRAIN_SAMPLES if CONFIG.MIN_TRAIN_SAMPLES > 0 else 0)
-
+        
         st.markdown("---")
-
-        if st.button("保存数据", use_container_width=True):
+        
+        if st.button("💾 保存数据", use_container_width=True):
             if system._save_data():
                 st.success("已保存")
-
-        if st.button("清空数据", use_container_width=True):
+        
+        if st.button("🗑️ 清空数据", use_container_width=True):
             system.df = pd.DataFrame(columns=[
                 'match_id', 'date', 'league', 'time', 'status', 'home_team', 'away_team',
                 'score', 'score_home', 'score_away', 'actual_result', 'has_result',
@@ -1409,12 +1833,12 @@ def main():
             ])
             system._save_data()
             st.success("已清空")
-
-    tabs = st.tabs(["数据概览", "预测中心"])
-
+    
+    tabs = st.tabs(["📊 数据概览", "🎯 预测中心"])
+    
     with tabs[0]:
         st.subheader("训练数据概览")
-
+        
         cols = st.columns(4)
         with cols[0]:
             st.metric("总比赛数", stats['total'])
@@ -1423,16 +1847,15 @@ def main():
         with cols[2]:
             st.metric("训练门槛", CONFIG.MIN_TRAIN_SAMPLES)
         with cols[3]:
-            st.metric("模型状态", "就绪" if stats['model_ready'] else "未训练")
-
+            st.metric("模型状态", "✅ 就绪" if stats['model_ready'] else "❌ 未训练")
+        
         if not system.df.empty:
             st.markdown("---")
-
+            
             display_df = system.df.copy()
             if 'actual_result' in display_df.columns:
-                has_result = display_df['actual_result'].isin(['主胜', '平局', '客胜'])
-                display_df = display_df[has_result]
-
+                display_df = display_df[display_df['actual_result'].isin(['主胜', '平局', '客胜'])]
+            
             display_cols = ['date', 'league', 'home_team', 'away_team', 'score', 'actual_result']
             display_cols = [c for c in display_cols if c in display_df.columns]
 
@@ -1446,43 +1869,58 @@ def main():
             if not display_df.empty:
                 display_df['odds'] = display_df.apply(get_odds_status, axis=1)
                 display_cols.append('odds')
-
+            
+            if not display_df.empty:
+                if 'order' in display_df.columns:
+                    display_df = display_df.sort_values(['date', 'order'])
+                
                 st.dataframe(display_df[display_cols], use_container_width=True, height=400)
+                
+                st.markdown("---")
+                st.subheader("赔率数据统计")
+                odds_stats = {}
+                for odds_type in ['europe', 'asia', 'handicap', 'daxiao']:
+                    if odds_type in display_df.columns:
+                        count = display_df[odds_type].apply(lambda x: len(x) > 0 if isinstance(x, list) else False).sum()
+                        odds_stats[odds_type] = count
+                
+                if odds_stats:
+                    st.write(odds_stats)
             else:
                 st.info("没有符合条件的数据")
         else:
             st.info("暂无数据，请使用侧边栏获取训练数据")
-
+    
     with tabs[1]:
         st.subheader("比赛预测")
-
+        
         if not system.df.empty and stats['model_ready']:
             future_matches = system.df[system.df['actual_result'] == ''] if 'actual_result' in system.df.columns else system.df
-
+            
             if not future_matches.empty:
                 selected = st.selectbox(
                     "选择比赛进行预测",
                     future_matches.to_dict('records'),
                     format_func=lambda x: f"{x.get('date', 'N/A')} | {x.get('league', 'N/A')} | {x.get('home_team', 'N/A')} vs {x.get('away_team', 'N/A')}"
                 )
-
+                
                 if selected:
                     col1, col2 = st.columns([2, 1])
-
+                    
                     with col1:
                         st.markdown(f"### {selected.get('home_team', 'N/A')} 🆚 {selected.get('away_team', 'N/A')}")
                         st.write(f"**联赛:** {selected.get('league', 'N/A')}")
-
+                        
                         europe_odds = selected.get('europe', [])
                         has_odds = europe_odds and len(europe_odds) > 0
                         if has_odds:
-                            st.write(f"**赔率数据:** 已获取 ({len(europe_odds)}家公司)")
+                            st.write(f"**赔率数据:** ✅ 已获取 ({len(europe_odds)}家公司)")
                         else:
-                            st.warning("暂无赔率数据")
-
+                            st.warning("⚠️ 暂无赔率数据")
+                    
                     with col2:
                         if has_odds:
-                            if st.button("开始预测", type="primary", use_container_width=True):
+                            if st.button("🔮 开始预测", type="primary", use_container_width=True):
                                 result, error = system.predict(selected)
                                 if error:
                                     st.error(error)
@@ -1504,12 +1942,12 @@ def main():
                         else:
                             st.info("请先获取赔率数据")
             else:
-                st.info("当前没有未预测的比赛。请使用侧边栏'获取未来比赛'功能获取待预测比赛。")
+                st.info("当前没有未预测的比赛")
         else:
             if not stats['model_ready']:
-                st.warning("模型未训练，请先训练模型")
+                st.warning("⚠️ 模型未训练")
             else:
-                st.info("暂无比赛数据。请使用侧边栏获取数据")
+                st.info("暂无比赛数据")
 
 if __name__ == "__main__":
     main()
